@@ -73,6 +73,7 @@ static void test_standard_json_tools_formats(testing & t);
 static void test_standard_json_tools_openai(testing & t);
 static void test_standard_json_tools_cohere(testing & t);
 static void test_standard_json_tools_function_key(testing & t);
+static void test_json_native_per_call_auto_grammar(testing & t);
 
 // normalize_quotes_to_json tests
 static void test_normalize_quotes_to_json(testing & t);
@@ -101,6 +102,7 @@ int main(int argc, char * argv[]) {
     t.test("nemotron", test_nemotron_analysis);
     t.test("smollm3", test_smollm3_analysis);
     t.test("standard_json_tools", test_standard_json_tools_formats);
+    t.test("json_native_per_call_auto_grammar", test_json_native_per_call_auto_grammar);
     t.test("normalize_quotes_to_json", test_normalize_quotes_to_json);
     t.test("tagged_args_embedded_quotes", test_tagged_args_with_embedded_quotes);
 
@@ -1669,6 +1671,30 @@ static void test_standard_json_tools_function_key(testing & t) {
     t.assert_true("content present", msg.content.find("I'll call the weather") != std::string::npos);
 }
 
+static void test_json_native_per_call_auto_grammar(testing & t) {
+    common_chat_template tmpl = load_template(t, "models/templates/Reka-Edge.jinja");
+
+    struct autoparser analysis;
+    analysis.analyze_template(tmpl);
+
+    generation_params params;
+    params.messages = json::array({
+        json{
+            {"role", "user"},
+            {"content", "What time is it?"}
+        }
+    });
+    params.tools = build_test_tools();
+    params.tool_choice = COMMON_CHAT_TOOL_CHOICE_AUTO;
+    params.enable_thinking = false;
+
+    auto generated = peg_generator::generate_parser(tmpl, params, analysis);
+
+    t.assert_true("lazy grammar enabled", generated.grammar_lazy);
+    t.assert_true("grammar contains per-call repetition", generated.grammar.find("tool-calls ::= (tool-call space)+") != std::string::npos);
+    t.assert_true("grammar does not repeat optional tool calls", generated.grammar.find("tool-call? space") == std::string::npos);
+}
+
 // ============================================================================
 // normalize_quotes_to_json Tests
 // ============================================================================
@@ -1966,4 +1992,3 @@ static void test_tagged_args_with_embedded_quotes(testing & t) {
         }
     }
 }
-
