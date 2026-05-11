@@ -60,9 +60,10 @@ std::vector<llama_token> mtp_speculative_gen_draft(
     float p_min,
     llama_token id_last,
     int32_t n_past,
-    llama_seq_id seq_id);
+    llama_seq_id seq_id,
+    bool constant_draft_positions = false);
 
-void mtp_update_kv_cache(struct llama_context * ctx, const llama_batch& batch, bool is_prompt_warmup);
+int32_t mtp_update_kv_cache(struct llama_context * ctx, const llama_batch& batch, bool is_prompt_warmup);
 
 void mtp_accept_tokens(
     struct llama_context * ctx,

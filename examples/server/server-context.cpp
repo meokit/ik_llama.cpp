@@ -16,6 +16,8 @@
 #include <regex>
 #include <exception>
 
+uint32_t llama_mtp_state_n_embd(const struct llama_context * ctx);
+
 static void server_prompt_checkpoint_update(server_prompt_checkpoint & ckpt, llama_context * ctx, int id, int64_t n_tokens, llama_pos pos_min = -1, llama_pos pos_max = -1, int32_t offset = 0) {
     if (pos_min == -1) {
         pos_min = llama_kv_cache_seq_pos_min(ctx, id);
@@ -44,6 +46,143 @@ static void log_text(const gpt_params & params_base, const std::string & text) {
     }
 }
 
+static bool params_use_gemma4_external_mtp(const gpt_params & params_base) {
+    return params_base.has_mtp &&
+        llama_model_is_gemma4_mtp_assistant(params_base.speculative.model_dft);
+}
+
+static llama_context * get_slot_mtp_ctx(server_slot & slot, llama_context * ctx) {
+    llama_context * mtp_ctx = common_speculative_get_mtp_ctx(slot.spec);
+    return mtp_ctx ? mtp_ctx : ctx;
+}
+
+static int get_ctx_mtp_n_embd(llama_context * ctx) {
+    return ctx ? (int) llama_mtp_state_n_embd(ctx) : 0;
+}
+
+static int get_slot_mtp_n_embd(server_slot & slot, llama_context * ctx) {
+    return get_ctx_mtp_n_embd(get_slot_mtp_ctx(slot, ctx));
+}
+
+static void cache_slot_mtp_hidden(server_slot & slot, const float * hidden, int n_embd) {
+    if (hidden == nullptr || n_embd <= 0) {
+        return;
+    }
+
+    slot.mtp_hidden_state.assign(hidden, hidden + n_embd);
+}
+
+static void sync_slot_mtp_hidden(server_slot & slot, llama_context * ctx) {
+    if (!slot.has_mtp || !slot.spec || slot.mtp_hidden_state.empty()) {
+        return;
+    }
+
+    const int n_embd = get_slot_mtp_n_embd(slot, ctx);
+    if (n_embd <= 0 || slot.mtp_hidden_state.size() < (size_t) n_embd) {
+        return;
+    }
+
+    const int n_hidden = slot.mtp_hidden_state.size() / n_embd;
+    llama_set_draft_input_hidden_state(get_slot_mtp_ctx(slot, ctx), slot.mtp_hidden_state.data() + (n_hidden - 1) * n_embd);
+}
+
+static void cache_and_sync_slot_mtp_hidden(server_slot & slot, llama_context * ctx, const float * hidden, int n_embd) {
+    cache_slot_mtp_hidden(slot, hidden, n_embd);
+    sync_slot_mtp_hidden(slot, ctx);
+}
+
+static void cache_and_sync_slot_mtp_hidden_from_rows(server_slot & slot, llama_context * ctx, const std::vector<float> & rows, int n_embd) {
+    if (rows.empty() || n_embd <= 0) {
+        return;
+    }
+
+    const size_t n_rows = rows.size() / n_embd;
+    if (n_rows == 0) {
+        return;
+    }
+
+    cache_and_sync_slot_mtp_hidden(slot, ctx, rows.data() + (n_rows - 1) * n_embd, n_embd);
+}
+
+static void apply_slot_mtp_accept(
+        server_slot & slot,
+        llama_context * ctx,
+        const std::vector<float> & mtp_hidden_state,
+        const std::vector<llama_token> & ids,
+        int32_t mtp_n_past_base,
+        int n_embd) {
+    if (!slot.has_mtp || mtp_hidden_state.empty() || n_embd <= 0) {
+        return;
+    }
+
+    llama_context * mtp_ctx = get_slot_mtp_ctx(slot, ctx);
+    if (slot.use_gemma4_external_mtp) {
+        cache_and_sync_slot_mtp_hidden_from_rows(slot, ctx, mtp_hidden_state, n_embd);
+        return;
+    }
+
+    slot.mtp_hidden_state = mtp_hidden_state;
+    llama_set_draft_input_hidden_state(mtp_ctx, slot.mtp_hidden_state.data());
+    mtp_accept_tokens(mtp_ctx, ids, mtp_n_past_base, slot.id);
+}
+
+static void set_external_mtp_hidden(server_slot & slot, llama_context * ctx, const float * hidden, int n_embd) {
+    if (!slot.has_mtp || !slot.spec || hidden == nullptr || n_embd <= 0) {
+        return;
+    }
+
+    cache_and_sync_slot_mtp_hidden(slot, ctx, hidden, n_embd);
+}
+
+struct server_mtp_warmup {
+    llama_context * ctx_tgt;
+    server_slot   * slot;
+};
+
+static int32_t server_mtp_warmup_batch(
+        llama_context * ctx_tgt,
+        llama_context * ctx_mtp,
+        const llama_batch * batch,
+        server_slot & slot) {
+    if (!ctx_tgt || !ctx_mtp || !batch || batch->n_tokens <= 0) {
+        return 0;
+    }
+
+    const float * emb = llama_get_embeddings(ctx_tgt);
+    const int n_embd_src = get_ctx_mtp_n_embd(ctx_tgt);
+    const int n_embd_dst = get_ctx_mtp_n_embd(ctx_mtp);
+    if (emb == nullptr || n_embd_src <= 0 || n_embd_dst <= 0) {
+        return -1;
+    }
+
+    if (n_embd_src != n_embd_dst) {
+        LOG_ERROR("MTP warmup hidden state width mismatch", {
+            {"n_embd_src", n_embd_src},
+            {"n_embd_dst", n_embd_dst},
+        });
+        return -1;
+    }
+
+    const float * last_hidden = emb + (batch->n_tokens - 1) * n_embd_src;
+    if (slot.use_gemma4_external_mtp) {
+        cache_and_sync_slot_mtp_hidden(slot, ctx_tgt, last_hidden, n_embd_dst);
+        return 0;
+    }
+
+    cache_slot_mtp_hidden(slot, last_hidden, n_embd_dst);
+    llama_set_draft_input_hidden_state(ctx_mtp, emb);
+    return mtp_update_kv_cache(ctx_mtp, *batch, true);
+}
+
+static int32_t server_mtp_media_warmup_callback(void * user_data, const llama_batch * batch) {
+    auto * data = static_cast<server_mtp_warmup *>(user_data);
+    if (data == nullptr || data->slot == nullptr) {
+        return 0;
+    }
+
+    return server_mtp_warmup_batch(data->ctx_tgt, get_slot_mtp_ctx(*data->slot, data->ctx_tgt), batch, *data->slot);
+}
+
 void server_speculative_checkpoint::clear() {
     valid = false;
     per_step_enabled = false;
@@ -63,7 +202,8 @@ static void discard_speculative_checkpoint(server_slot & slot, llama_context * c
 
 static bool save_speculative_checkpoint(server_slot & slot, llama_model * model, llama_context * ctx, int ckpt_mode) {
     slot.spec_ckpt.clear();
-    slot.spec_ckpt.n_past = slot.n_past - (int32_t)(slot.drafted.size() + 1);
+    const int32_t n_pre_spec_tokens = slot.cache_tokens.n_tokens() - (int32_t)(slot.drafted.size() + 1);
+    slot.spec_ckpt.n_past = slot.cache_tokens.pos_next(n_pre_spec_tokens);
     slot.spec_ckpt.sampled = slot.sampled;
 
     const int max_tokens = (int)slot.drafted.size() + 1;
@@ -173,7 +313,8 @@ bool server_context::load_model(const gpt_params& params_) {
             LOG_ERROR("%s\n", "err: speculative decode is not supported by multimodal");
             return false;
         }
-        if (params_base.speculative.type != COMMON_SPECULATIVE_TYPE_NONE) {
+        if (params_base.speculative.type != COMMON_SPECULATIVE_TYPE_NONE &&
+                params_base.speculative.type != COMMON_SPECULATIVE_TYPE_MTP) {
             params_base.speculative.type = COMMON_SPECULATIVE_TYPE_NONE;
             SRV_WRN("%s\n", "speculative decoding is not supported by multimodal, it will be disabled");
         }
@@ -185,6 +326,7 @@ bool server_context::load_model(const gpt_params& params_) {
         gpt_params params_dft;
         params_dft.devices      = params_base.speculative.devices;
         params_dft.model        = params_base.speculative.model;
+        params_dft.main_gpu     = params_base.main_gpu;
         params_dft.n_gpu_layers = params_base.speculative.n_gpu_layers;
         params_dft.rpc_servers  = params_base.rpc_servers;
         params_dft.cache_type_k = params_base.speculative.cache_type_k.empty() ? params_base.cache_type_k : params_base.speculative.cache_type_k;
@@ -279,16 +421,22 @@ void server_context::init() {
         slot.sparams = params_base.sparams;
 
         if (params_base.has_mtp) {
-            if (llama_model_n_nextn_layer(model) > 0) {
+            const bool has_external_mtp = params_use_gemma4_external_mtp(params_base);
+
+            if (llama_model_n_nextn_layer(model) > 0 || has_external_mtp) {
                 params_base.speculative.type = COMMON_SPECULATIVE_TYPE_MTP;
                 params_base.pooling_type = LLAMA_POOLING_TYPE_NONE;
 
-                params_base.speculative.cparams_dft = common_context_params_to_llama(params_base);
+                if (!has_external_mtp) {
+                    params_base.speculative.cparams_dft = common_context_params_to_llama(params_base);
+                }
+
                 params_base.speculative.cparams_dft.mtp          = true;
                 params_base.speculative.cparams_dft.mtp_op_type  = MTP_OP_WARMUP;
                 params_base.speculative.cparams_dft.embeddings   = true;
 
                 slot.has_mtp = true;
+                slot.use_gemma4_external_mtp = has_external_mtp;
                 slot.params.speculative.type = COMMON_SPECULATIVE_TYPE_MTP;
                 slot.params.speculative.n_min = 0;
                 slot.params.speculative.cparams_dft = params_base.speculative.cparams_dft;
@@ -317,7 +465,7 @@ void server_context::init() {
         if (can_spec) {
             slot.spec = common_speculative_init(params_base.speculative, slot.ctx);
             if (slot.spec) {
-                if (mctx) {
+                if (mctx && !slot.has_mtp) {
                     SRV_ERR("%s\n", "speculative decoding is not supported with multimodal");
                     return;
                 }
@@ -3273,30 +3421,27 @@ void server_context::add_sampled_tokens() {
         //       perform the speculative drafting for all sequences at the same time in a single batch
         const int n_draft_max_pre = slot.get_n_draft_max();
         if (n_draft_max_pre > 0) {
-            if (mctx) {
+            if (mctx && !slot.has_mtp) {
                 // we should never reach this, as speculative is automatically disabled if mmproj is loaded
                 GGML_ABORT("not supported by multimodal");
             }
 
-            const llama_tokens & cached_text_tokens = slot.cache_tokens.get_text_tokens();
+            static const llama_tokens empty_prompt;
+            const llama_tokens & cached_text_tokens = slot.has_mtp
+                ? empty_prompt
+                : slot.cache_tokens.get_text_tokens();
 
             auto & params_spec = slot.params.speculative;
 
             if (slot.has_mtp) {
-                llama_context * mtp_ctx = common_speculative_get_mtp_ctx(slot.spec);
-                llama_context * hs_ctx = mtp_ctx ? mtp_ctx : ctx;
                 if (!slot.mtp_hidden_state.empty()) {
-                    const int n_embd = llama_model_n_embd(llama_get_model(ctx));
-                    const int n_hidden = slot.mtp_hidden_state.size() / n_embd;
-                    llama_set_draft_input_hidden_state(hs_ctx, slot.mtp_hidden_state.data() + (n_hidden - 1) * n_embd);
+                    sync_slot_mtp_hidden(slot, ctx);
                 } else {
                     LOG_ERROR("MTP hidden state is empty during speculation", {});
                     const float* emb_neg1 = llama_get_embeddings_ith(ctx, -1);
                     if (emb_neg1) {
-                        const int n_embd = llama_model_n_embd(llama_get_model(ctx));
-                        slot.mtp_hidden_state.resize(n_embd);
-                        memcpy(slot.mtp_hidden_state.data(), emb_neg1, n_embd * sizeof(float));
-                        llama_set_draft_input_hidden_state(hs_ctx, slot.mtp_hidden_state.data());
+                        const int n_embd = get_ctx_mtp_n_embd(ctx);
+                        cache_and_sync_slot_mtp_hidden(slot, ctx, emb_neg1, n_embd);
                     }
                 }
             }
@@ -3710,7 +3855,15 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     // process the image
                     size_t n_tokens_out = 0;
                     llama_pos p1 = slot.cache_tokens.pos_next() + slot.n_past_prompt - slot.n_past; // add offset to prompt
-                    int32_t res = slot.prompt_tokens.process_chunk(ctx, mctx, slot.n_past_prompt, p1, slot.id, n_tokens_out);
+                    server_mtp_warmup mtp_media_warmup {
+                        ctx,
+                        slot.has_mtp && slot.spec ? &slot : nullptr,
+                    };
+                    mtmd_helper_eval_batch_callback mtp_media_callback =
+                        mtp_media_warmup.slot ? server_mtp_media_warmup_callback : nullptr;
+                    int32_t res = slot.prompt_tokens.process_chunk(
+                            ctx, mctx, slot.n_past_prompt, p1, slot.id, n_tokens_out,
+                            mtp_media_callback, &mtp_media_warmup);
                     if (res != 0) {
                         LLAMA_LOG_ERROR("failed to process image, res = %d\n", res);
                         slot.release();
@@ -3864,11 +4017,8 @@ static void restore_speculative_checkpoint(
 
         // Update MTP KV cache and hidden state using embeddings collected before checkpoint restore.
         if (slot.has_mtp && !mtp_hidden_state_pre.empty()) {
-            slot.mtp_hidden_state = mtp_hidden_state_pre;
-            llama_context * mtp_ctx = common_speculative_get_mtp_ctx(slot.spec);
-            llama_context * mtp_target = mtp_ctx ? mtp_ctx : ctx;
-            llama_set_draft_input_hidden_state(mtp_target, slot.mtp_hidden_state.data());
-            mtp_accept_tokens(mtp_target, ids, mtp_n_past_base, slot.id);
+            const int n_embd = get_ctx_mtp_n_embd(ctx);
+            apply_slot_mtp_accept(slot, ctx, mtp_hidden_state_pre, ids, mtp_n_past_base, n_embd);
         }
 
         SLT_DBG(slot, "per-step restore: step=%d (rejected %d drafts)\n",
@@ -3902,7 +4052,7 @@ static void restore_speculative_checkpoint(
                 SLT_ERR(slot, "failed to re-decode accepted tokens after checkpoint restore: %d\n", ret);
             }
             if (slot.has_mtp) {
-                const int n_embd = llama_model_n_embd(llama_get_model(ctx));
+                const int n_embd = get_ctx_mtp_n_embd(ctx);
 
                 const int n_accepted = (int)ids.size();
                 slot.mtp_hidden_state.resize(n_accepted * n_embd);
@@ -3913,15 +4063,18 @@ static void restore_speculative_checkpoint(
                     }
                 }
 
-                llama_context * mtp_ctx_rej = common_speculative_get_mtp_ctx(slot.spec);
-                llama_context * mtp_target_rej = mtp_ctx_rej ? mtp_ctx_rej : ctx;
-                llama_set_draft_input_hidden_state(mtp_target_rej, slot.mtp_hidden_state.data());
-                mtp_accept_tokens(mtp_target_rej, ids, slot.spec_ckpt.n_past, slot.id);
+                if (slot.use_gemma4_external_mtp) {
+                    cache_and_sync_slot_mtp_hidden_from_rows(slot, ctx, slot.mtp_hidden_state, n_embd);
+                } else {
+                    llama_context * mtp_ctx = get_slot_mtp_ctx(slot, ctx);
+                    llama_set_draft_input_hidden_state(mtp_ctx, slot.mtp_hidden_state.data());
+                    mtp_accept_tokens(mtp_ctx, ids, slot.spec_ckpt.n_past, slot.id);
 
-                if (n_accepted > 1) {
-                    memmove(slot.mtp_hidden_state.data(),
-                            slot.mtp_hidden_state.data() + (n_accepted - 1) * n_embd,
-                            n_embd * sizeof(float));
+                    if (n_accepted > 1) {
+                        memmove(slot.mtp_hidden_state.data(),
+                                slot.mtp_hidden_state.data() + (n_accepted - 1) * n_embd,
+                                n_embd * sizeof(float));
+                    }
                 }
                 slot.mtp_hidden_state.resize(n_embd);
             }
@@ -3977,9 +4130,10 @@ void server_context::speculative_decoding_accept() {
         int32_t mtp_n_past_base = 0;
         std::vector<float> mtp_hidden_state_pre;
         if (slot.has_mtp) {
-            mtp_n_past_base = slot.n_past - (slot.drafted.size() + 1);
+            const int32_t n_pre_spec_tokens = slot.cache_tokens.n_tokens() - (int32_t)(slot.drafted.size() + 1);
+            mtp_n_past_base = slot.cache_tokens.pos_next(n_pre_spec_tokens);
 
-            const int n_embd = llama_model_n_embd(llama_get_model(ctx));
+            const int n_embd = get_ctx_mtp_n_embd(ctx);
             if (!ids.empty()) {
                 mtp_hidden_state_pre.resize(ids.size() * n_embd);
                 for (size_t i = 0; i < ids.size(); i++) {
@@ -4015,7 +4169,9 @@ void server_context::speculative_decoding_accept() {
         slot.cache_tokens.keep_first(slot.cache_tokens.n_tokens() - n_draft);
 
         // add accepted tokens to the prompt
-        slot.cache_tokens.insert({ ids.begin(), ids.end() - 1 });
+        for (auto it = ids.begin(); it != ids.end() - 1; ++it) {
+            slot.cache_tokens.push_back(*it);
+        }
         slot.sampled = ids.back(); // last accepted token
         slot.n_past = slot.cache_tokens.n_tokens();
 
@@ -4025,13 +4181,9 @@ void server_context::speculative_decoding_accept() {
             restore_speculative_checkpoint(slot, ctx, model, ids, n_draft, mtp_hidden_state_pre, mtp_n_past_base);
         } else {
             if (slot.has_mtp && !mtp_hidden_state_pre.empty()) {
-                    llama_context * mtp_ctx = common_speculative_get_mtp_ctx(slot.spec);
-                    llama_context * mtp_target = mtp_ctx ? mtp_ctx : ctx;
-
-                    slot.mtp_hidden_state = std::move(mtp_hidden_state_pre);
-                    llama_set_draft_input_hidden_state(mtp_target, slot.mtp_hidden_state.data());
-                    mtp_accept_tokens(mtp_target, ids, mtp_n_past_base, slot.id);
-                }
+                const int n_embd = get_ctx_mtp_n_embd(ctx);
+                apply_slot_mtp_accept(slot, ctx, mtp_hidden_state_pre, ids, mtp_n_past_base, n_embd);
+            }
             llama_kv_cache_seq_rm(ctx, slot.id, slot.cache_tokens.pos_next(slot.n_past), -1);
             discard_speculative_checkpoint(slot, ctx);
         }
@@ -4402,29 +4554,24 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             continue; // continue loop of n_batch
         }
 
-        bool mtp_warmup_needed = false;
-        std::vector<float> batch_mtp_hidden_state;
+        server_slot * mtp_warmup_slot = nullptr;
         if (params_base.has_mtp) {
             for (auto& slot : slots) {
                 if ((slot.state == SLOT_STATE_PROCESSING && slot.n_decoded == 0) ||
                     (slot.state == SLOT_STATE_IDLE && slot.command == SLOT_COMMAND_LOAD_PROMPT)) {
                     bool has_tokens_for_slot = (batch_view.n_tokens > 0 && batch_view.n_seq_id[0] > 0 && batch_view.seq_id[0][0] == slot.id);
                     if (has_tokens_for_slot) {
-                        mtp_warmup_needed = true;
+                        mtp_warmup_slot = &slot;
                         break;
                     }
                 }
             }
-            if (mtp_warmup_needed) {
-                const int n_embd = llama_model_n_embd(llama_get_model(ctx)); 
-                const int n_toks = batch_view.n_tokens;
-                batch_mtp_hidden_state.resize(n_toks * n_embd);
-                for (int t = 0; t < n_toks; t++) {
-                    const float* emb_t = llama_get_embeddings_ith(ctx, t);
-                    if (emb_t) {
-                        memcpy(batch_mtp_hidden_state.data() + t * n_embd, emb_t, n_embd * sizeof(float));
-                    }
-                }
+        }
+
+        if (mtp_warmup_slot && mtp_warmup_slot->spec && mtp_warmup_slot->has_mtp) {
+            llama_context * mtp_ctx = get_slot_mtp_ctx(*mtp_warmup_slot, ctx);
+            if (server_mtp_warmup_batch(ctx, mtp_ctx, &batch_view, *mtp_warmup_slot) != 0) {
+                LOG_ERROR("%s\n", "failed to warm up MTP state from prompt batch");
             }
         }
 
@@ -4452,7 +4599,11 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             }
 
             if (slot.n_decoded == 0 && slot.can_speculate()) {
-                common_speculative_begin(slot.spec, slot.cache_tokens.get_text_tokens());
+                static const llama_tokens empty_prompt;
+                const llama_tokens & spec_prompt = slot.has_mtp
+                    ? empty_prompt
+                    : slot.cache_tokens.get_text_tokens();
+                common_speculative_begin(slot.spec, spec_prompt);
             }
 
             if (slot.i_batch_dft.size() > 0) {
@@ -4473,12 +4624,15 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             completion_token_output result;
             const int tok_idx = slot.i_batch - i;
 
-            if (params_base.has_mtp && slot.n_decoded == 0) {
+            if (slot.has_mtp && slot.n_decoded == 0) {
                 const float* emb_i = llama_get_embeddings_ith(ctx, tok_idx);
                 if (emb_i) {
-                    const int n_embd = llama_model_n_embd(llama_get_model(ctx));
-                    slot.mtp_hidden_state.resize(n_embd);
-                    memcpy(slot.mtp_hidden_state.data(), emb_i, n_embd * sizeof(float));
+                    const int n_embd = get_ctx_mtp_n_embd(ctx);
+                    if (slot.use_gemma4_external_mtp) {
+                        set_external_mtp_hidden(slot, ctx, emb_i, n_embd);
+                    } else {
+                        cache_slot_mtp_hidden(slot, emb_i, n_embd);
+                    }
                 }
             }
 
@@ -4543,19 +4697,6 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
 
             slot.i_batch = -1;
         }
-        if (mtp_warmup_needed && !batch_mtp_hidden_state.empty()) {
-            llama_context * mtp_ctx = nullptr;
-            for (auto & slot : slots) {
-                if (slot.spec && slot.has_mtp) {
-                    llama_context * mc = common_speculative_get_mtp_ctx(slot.spec);
-                    if (mc) { mtp_ctx = mc; break; }
-                }
-            }
-            llama_context * mtp_target = mtp_ctx ? mtp_ctx : ctx;
-            llama_set_draft_input_hidden_state(mtp_target, batch_mtp_hidden_state.data());
-            mtp_update_kv_cache(mtp_target, batch_view, true);
-        }
-
         // speculative decoding - main model sample and accept
         speculative_decoding_accept();
     }

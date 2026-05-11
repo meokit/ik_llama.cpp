@@ -19,6 +19,9 @@
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
 
+void llama_set_mtp_target_context(struct llama_context * ctx, struct llama_context * target_ctx);
+uint32_t llama_mtp_state_n_embd(const struct llama_context * ctx);
+
 const std::vector<enum common_speculative_type> common_speculative_types = {
     COMMON_SPECULATIVE_TYPE_NONE,
     COMMON_SPECULATIVE_TYPE_DRAFT,
@@ -154,27 +157,28 @@ struct common_speculative_state_mtp : public common_speculative_state {
     llama_context * ctx_tgt;
     llama_context * ctx_mtp = nullptr;
     common_sampler * smpl;
+    // For Gemma 4 external MTP assistant: draft positions are held constant
+    bool constant_draft_positions = false;
 
     common_speculative_state_mtp(
             enum common_speculative_type type,
             llama_context * ctx_tgt,
-            const llama_context_params & mtp_cparams)
+            llama_context * ctx_mtp,
+            bool constant_draft_positions = false)
         : common_speculative_state(type)
         , ctx_tgt(ctx_tgt)
+        , ctx_mtp(ctx_mtp)
+        , constant_draft_positions(constant_draft_positions)
     {
-        struct common_params_sampling params;
-        params.samplers_sequence = {
+        struct common_params_sampling sparams;
+        sparams.samplers_sequence = {
             llama_sampler_type::DIST,
         };
-        smpl = common_sampler_init(llama_get_model(ctx_tgt), params);
+        smpl = common_sampler_init(llama_get_model(ctx_mtp), sparams);
+        llama_set_mtp_target_context(ctx_mtp, ctx_tgt);
 
-        const llama_model * model = llama_get_model(ctx_tgt);
-        ctx_mtp = llama_init_from_model(const_cast<llama_model *>(model), mtp_cparams);
-        if (ctx_mtp) {
-            LOG_INF("%s: created MTP context (n_ctx=%d)\n", __func__, llama_n_ctx(ctx_mtp));
-        } else {
-            LOG_ERR("%s: failed to create MTP context\n", __func__);
-        }
+        LOG_INF("%s: MTP context ready (n_ctx=%d, constant_draft_positions=%s)\n", __func__,
+                llama_n_ctx(ctx_mtp), constant_draft_positions ? "true" : "false");
     }
 
     ~common_speculative_state_mtp() override {
@@ -194,12 +198,14 @@ struct common_speculative_state_mtp : public common_speculative_state {
             llama_token id_last,
             llama_tokens & result) override {
 
-        int32_t n_past = (int32_t)prompt_tgt.size();
         llama_seq_id seq_id = 0;
 
         llama_pos mtp_pos_max = llama_kv_cache_seq_pos_max(ctx_mtp, seq_id);
-        if (mtp_pos_max >= n_past) {
-            llama_kv_cache_seq_rm(ctx_mtp, seq_id, n_past, -1);
+        int32_t n_past = mtp_pos_max >= 0 ? (int32_t)mtp_pos_max + 1 : (int32_t)prompt_tgt.size();
+
+        if (!prompt_tgt.empty() && mtp_pos_max < (llama_pos)prompt_tgt.size() - 1) {
+            LOG_WRN("%s: MTP context not fully warmed up: pos_max = %d, expected = %d\n",
+                    __func__, (int)mtp_pos_max, (int)prompt_tgt.size() - 1);
         }
 
         llama_context * ctx = ctx_mtp;
@@ -211,7 +217,8 @@ struct common_speculative_state_mtp : public common_speculative_state {
             params.p_min,
             id_last,
             n_past,
-            seq_id
+            seq_id,
+            constant_draft_positions
         );
     }
 
@@ -1029,9 +1036,9 @@ common_speculative * common_speculative_init(
     // Compute the implementations to use based on the config and their order of preference
     std::vector<common_speculative_config> configs = {}; // list of speculative configs to try
     {
-        bool has_draft = !params.mparams_dft.path.empty();
         bool has_draft_eagle3 = false; // TODO PR-18039: if params.speculative.eagle3
         bool has_mtp = (params.type == COMMON_SPECULATIVE_TYPE_MTP); 
+        bool has_draft = !params.mparams_dft.path.empty() && !has_mtp;
 
         bool has_ngram_cache   = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_CACHE);
         bool has_ngram_simple  = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE);
@@ -1102,15 +1109,20 @@ common_speculative * common_speculative_init(
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_MTP: {
-                auto mtp_state = std::make_unique<common_speculative_state_mtp>(config.type,
-                    /* .ctx_tgt      = */ ctx_tgt,
-                    /* .mtp_cparams  = */ params.cparams_dft
-                );
-                if (!mtp_state->ctx_mtp) {
-                    LOG_ERR("%s: failed to create MTP context\n", __func__);
-                    return nullptr;
+                llama_context * ctx_mtp = ctx_dft;
+                if (!ctx_mtp) {
+                    const llama_model * model = llama_get_model(ctx_tgt);
+                    ctx_mtp = llama_init_from_model(const_cast<llama_model *>(model), params.cparams_dft);
+                    if (!ctx_mtp) {
+                        LOG_ERR("%s: failed to create MTP context\n", __func__);
+                        return nullptr;
+                    }
                 }
-                impls.push_back(std::move(mtp_state));
+                ctx_dft = nullptr;
+
+                const bool use_constant_draft_positions = llama_model_is_gemma4_mtp_assistant(llama_get_model(ctx_mtp));
+                impls.push_back(std::make_unique<common_speculative_state_mtp>(
+                    config.type, ctx_tgt, ctx_mtp, use_constant_draft_positions));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_EAGLE3: {
@@ -1224,7 +1236,7 @@ static mtp_last_embd & mtp_get_last_embd(const llama_context * ctx) {
     static std::unordered_map<const llama_context *, mtp_last_embd> map;
     auto & last = map[ctx];
     if (last.embd.empty()) {
-        auto n_embd = llama_model_n_embd(llama_get_model(ctx));
+        auto n_embd = llama_mtp_state_n_embd(ctx);
         last.embd.resize(n_embd);
     }
     return last;
@@ -1377,7 +1389,8 @@ std::vector<llama_token> mtp_speculative_gen_draft(
     float p_min,
     llama_token id_last,
     int32_t n_past,
-    llama_seq_id seq_id) {
+    llama_seq_id seq_id,
+    bool constant_draft_positions) {
 
     llama_tokens drafts;
     drafts.reserve(n_draft);
@@ -1394,12 +1407,14 @@ std::vector<llama_token> mtp_speculative_gen_draft(
 
     llama_token current_input_id = id_last;
     int32_t current_n_past = n_past;
-    const int n_embd = llama_model_n_embd(llama_get_model(ctx));
+    const int n_embd = llama_mtp_state_n_embd(ctx);
 
     auto & last = mtp_get_last_embd(ctx);
     int i0 = 0;
     if (last.last_id >= 0) {
         if (last.prob < p_min) {
+            llama_batch_free(mtp_batch);
+            llama_set_mtp_op_type(ctx, MTP_OP_NONE);
             return drafts;
         }
         current_input_id = last.last_id;
@@ -1410,17 +1425,21 @@ std::vector<llama_token> mtp_speculative_gen_draft(
         i0 = 1;
     }
 
+    int n_decode = 0;
     for (int i = i0; i < n_draft; ++i) {
         mtp_batch.n_tokens = 0;
-        common_batch_add(mtp_batch, current_input_id, current_n_past, {seq_id}, true);
+        const int32_t draft_pos = constant_draft_positions ? n_past : current_n_past;
+        common_batch_add(mtp_batch, current_input_id, draft_pos, {seq_id}, true);
 
+        ++n_decode;
         if (llama_decode(ctx, mtp_batch) != 0) {
             break;
         }
 
         llama_token id_next = common_sampler_sample_speculative(smpl, ctx, 0, prob_ptr);
+
         if (i > 0 && prob_ptr && prob < p_min) {
-            return drafts;
+            break;
         }
 
         drafts.push_back(id_next);
@@ -1446,17 +1465,24 @@ std::vector<llama_token> mtp_speculative_gen_draft(
 
     // Purge the metadata for the draft tokens.
     // This prevents cache state corruption where two cells map to the same logical position.
-    if (!drafts.empty()) {
-        llama_kv_cache_seq_rm(ctx, seq_id, n_past, current_n_past);
+    // If the state contained in `last` had a valid token id and probability, it means that we
+    // have previously run an "accept" batch, where the token sampled from the main model was included.
+    // In that case, we need to discard all tokens that we ran here to get the KV cache to the correct state.
+    //   => for i0 = 1 we discard from n_past
+    // But if we did not have a valid last token_id, it means the first token we run was sampled from the
+    // main model. Hence we want to keep this token in the KV cache and discard all other tokens.
+    //   => for i0 = 0 we discard from n_past + 1
+    if (n_decode > 0) {
+        llama_kv_cache_seq_rm(ctx, seq_id, n_past + 1 - i0, n_past + n_decode + 2);
     }
 
     return drafts;
 }
 
 
-void mtp_update_kv_cache(struct llama_context * ctx, const llama_batch& batch, bool is_prompt_warmup) {
+int32_t mtp_update_kv_cache(struct llama_context * ctx, const llama_batch& batch, bool is_prompt_warmup) {
     if (batch.n_tokens == 0) {
-        return;
+        return 0;
     }
 
     llama_seq_id seq_id    = batch.seq_id[0][0];
@@ -1485,8 +1511,9 @@ void mtp_update_kv_cache(struct llama_context * ctx, const llama_batch& batch, b
         }
     }
 
-    llama_decode(ctx, mtp_batch);
+    const int32_t ret = llama_decode(ctx, mtp_batch);
     llama_set_mtp_op_type(ctx, MTP_OP_NONE);
+    return ret;
 }
 
 void mtp_accept_tokens(
@@ -1503,7 +1530,11 @@ void mtp_accept_tokens(
         common_batch_add(accepted_batch, ids[i], n_past_base + i, { seq_id }, true);
     }
 
-    mtp_update_kv_cache(ctx, accepted_batch, false);
+    if (mtp_update_kv_cache(ctx, accepted_batch, false) != 0) {
+        LOG_ERR("failed to update MTP KV cache for accepted tokens\n");
+        llama_batch_free(accepted_batch);
+        return;
+    }
 
     auto & last = mtp_get_last_embd(ctx);
     auto embd = llama_get_embeddings_ith(ctx, ids.size() - 1);
