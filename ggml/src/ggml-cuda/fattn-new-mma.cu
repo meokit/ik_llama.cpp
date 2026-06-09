@@ -2122,7 +2122,10 @@ template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
 
-    if constexpr ((DKQ == 576 || DKQ == 512) && ncols2 <= 4) {
+    if constexpr (DKQ == 512 && ncols2 == 2) {
+        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8, ncols2>(ctx, dst);
+    }
+    else if constexpr ((DKQ == 576 || DKQ == 512) && ncols2 <= 4) {
         ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 4, ncols2>(ctx, dst);
     } else {
 
@@ -2132,7 +2135,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
         //    return;
         //} else {
         if (Q->ne[1] <= 8/ncols2) {
-            if constexpr (DKQ == 512) {
+            if constexpr (DKQ == 512 || DKQ == 576) {
                 ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 2, ncols2>(ctx, dst);
             } else {
                 ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8/ncols2, ncols2>(ctx, dst);
@@ -2147,7 +2150,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
         return;
     }
 
-    if (Q->ne[1] <= 32/ncols2) {
+    if (Q->ne[1] <= 32/ncols2 || (DKQ == 512 && ncols2 == 16)) {
         ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
         return;
     }
@@ -2255,11 +2258,23 @@ void ggml_cuda_flash_attn_ext_mma_new(ggml_backend_cuda_context & ctx, ggml_tens
         return;
     }
     if (Q->ne[0] == 512 && K->ne[0] == 512 && V->ne[0] == 512) {
-        if (gqa_ratio == 8) {
+        // head_dim 512: ncols2=16 exceeds the max dynamic shared memory on some GPUs (e.g. Ada,
+        // where cudaFuncSetAttribute returns invalid argument), so route gqa_ratio % 8 == 0
+        // (covers 8 and 16) through the ncols2=8 kernel. It iterates over Q-head groups
+        // (iter_z = ceil(gqa_ratio/ncols2)), so 16 heads run as two passes of 8. This unblocks
+        // head_dim-512 models with a 16:1 GQA ratio such as Gemma 4 12B's global layers.
+        if (gqa_ratio % 16 == 0) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<512, 512, 16>(ctx, dst);
+        }
+        else if (gqa_ratio % 8 == 0) {
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<512, 512, 8>(ctx, dst);
         }
-        else if (gqa_ratio == 4) {
+        else if (gqa_ratio % 4 == 0) {
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<512, 512, 4>(ctx, dst);
+        }
+        else if (gqa_ratio % 2 == 0) {
+            // Gemma4-4B assistant
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<512, 512, 2>(ctx, dst);
         }
         else {
             GGML_ABORT("Fatal error");
@@ -2275,8 +2290,14 @@ void ggml_cuda_flash_attn_ext_mma_new(ggml_backend_cuda_context & ctx, ggml_tens
         }
         return;
     }
+    if (gqa_ratio % 12 == 0 && Q->ne[1] <= 4 && K->ne[1] >= 2048) {
+        ggml_cuda_flash_attn_ext_mma_f16_case<576, 512, 1, 16>(ctx, dst);
+        return;
+    }
     if (gqa_ratio % 16 == 0) {
         ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<576, 512, 16>(ctx, dst);
+    } else if (gqa_ratio % 8 == 0) {
+        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<576, 512, 8>(ctx, dst);
     } else if (gqa_ratio % 4 == 0) {
         ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<576, 512, 4>(ctx, dst);
     } else {

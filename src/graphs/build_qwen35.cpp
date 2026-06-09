@@ -5,7 +5,7 @@
 
 ggml_cgraph * llm_build_context::build_qwen35moe() {
 
-    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, model.max_nodes(n_tokens), false);
+    ggml_cgraph * gf = new_graph_custom();
 
     const int64_t n_embd_head = hparams.n_embd_head_v(0);
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k(0));
@@ -88,7 +88,7 @@ ggml_cgraph * llm_build_context::build_qwen35moe() {
 
 ggml_cgraph * llm_build_context::build_qwen35() {
 
-    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, model.max_nodes(n_tokens), false);
+    ggml_cgraph * gf = new_graph_custom();
 
     const int64_t n_embd_head = hparams.n_embd_head_v(0);
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k(0));
@@ -238,7 +238,7 @@ struct ggml_tensor * llm_build_context::build_qwen35moe_mtp(
 
     cb(cur, "result_norm", -1);
 
-    cur = build_output(lctx, ctx0, cur, model.output, mtp_layer.nextn.shared_head_norm, cb);
+    cur = build_output(lctx, ctx0, cur, model.output_mtp, mtp_layer.nextn.shared_head_norm, cb);
     cb(cur, "result_output", -1);
 
     return cur;
@@ -317,7 +317,7 @@ struct ggml_tensor * llm_build_context::build_qwen35_mtp(
     cb(cur, "result_norm", -1);
 
     //cur = build_output(lctx, ctx0, cur, model.output, nullptr, cb);
-    cur = build_output(lctx, ctx0, cur, model.output, mtp_layer.nextn.shared_head_norm, cb);
+    cur = build_output(lctx, ctx0, cur, model.output_mtp, mtp_layer.nextn.shared_head_norm, cb);
     cb(cur, "result_output", -1);
 
     return cur;

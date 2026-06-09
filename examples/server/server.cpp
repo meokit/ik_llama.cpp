@@ -1,6 +1,8 @@
 #pragma warning(disable : 4996)
 #include "server-context.h"
 #include "server-common.h"
+#include "server-chat.h"
+#include "server-cors-proxy.h"
 #include "chat.h"
 
 #include "common.h"
@@ -584,7 +586,13 @@ int main(int argc, char ** argv) {
         state.store(SERVER_STATE_ERROR);
         return 1;
     } else {
-        ctx_server.init();
+        try {
+            ctx_server.init();
+        } catch (const std::exception & e) {
+            LOG_ERROR("server init failed", {{"error", e.what()}});
+            state.store(SERVER_STATE_ERROR);
+            return 1;
+        }
         state.store(SERVER_STATE_READY);
     }
 
@@ -1013,7 +1021,8 @@ int main(int argc, char ** argv) {
                 {"vision", ctx_server.chat_params.allow_image},
                 {"audio",  ctx_server.chat_params.allow_audio},
             } },
-            { "n_ctx",                       ctx_server.n_ctx }
+            { "n_ctx",                       ctx_server.n_ctx },
+            { "cors_proxy_enabled",          ctx_server.params_base.webui_mcp_proxy},
 
         };
 
@@ -1291,7 +1300,7 @@ int main(int argc, char ** argv) {
         log_prompt(ctx_server.params_base, json::parse(req.body));
         auto body = json::parse(req.body);
         std::vector<raw_buffer> files;
-        json body_parsed = convert_responses_to_chatcmpl(body);
+        json body_parsed = server_chat_convert_responses_to_chatcmpl(body);
         json data = oaicompat_chat_params_parse(body_parsed, ctx_server.chat_params, files);
         handle_completions_impl(
             SERVER_TASK_TYPE_COMPLETION,
@@ -1305,7 +1314,7 @@ int main(int argc, char ** argv) {
     const auto handle_anthropic_messages = [&ctx_server, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
         std::vector<raw_buffer> files;
         log_prompt(ctx_server.params_base, json::parse(req.body));
-        json body = convert_anthropic_to_oai(json::parse(req.body));
+        json body = server_chat_convert_anthropic_to_oai(json::parse(req.body));
         SRV_DBG("%s\n", "Request converted: Anthropic -> OpenAI Chat Completions");
         SRV_DBG("converted request: %s\n", body.dump().c_str());
         json body_parsed = oaicompat_chat_params_parse(
@@ -1324,7 +1333,7 @@ int main(int argc, char ** argv) {
     const auto handle_anthropic_count_tokens = [&ctx_server, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
         std::vector<raw_buffer> files;
         log_prompt(ctx_server.params_base, json::parse(req.body));
-        json body = convert_anthropic_to_oai(json::parse(req.body));
+        json body = server_chat_convert_anthropic_to_oai(json::parse(req.body));
         SRV_DBG("%s\n", "Request converted: Anthropic -> OpenAI Chat Completions");
         SRV_DBG("converted request: %s\n", body.dump().c_str());
         json body_parsed = oaicompat_chat_params_parse(
@@ -2100,6 +2109,16 @@ int main(int argc, char ** argv) {
             svr->Post("/zstd_update_transparent", handle_zstd_config_update);
 	}
 #endif
+    }
+
+    // CORS proxy (EXPERIMENTAL, only used by the Web UI for MCP)
+    if (params.webui_mcp_proxy) {
+        SRV_WRN("%s", "-----------------\n");
+        SRV_WRN("%s", "CORS proxy is enabled, do not expose server to untrusted environments\n");
+        SRV_WRN("%s", "This feature is EXPERIMENTAL and may be removed or changed in future versions\n");
+        SRV_WRN("%s", "-----------------\n");
+        svr->Get("/cors-proxy", proxy_handler_get);
+        svr->Post("/cors-proxy", proxy_handler_post);
     }
     //
     // Start the server

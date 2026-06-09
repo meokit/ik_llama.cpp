@@ -63,6 +63,11 @@ static void gemma4_mtp_prepare_frozen_kv_views(
     k_parts.reserve(split_k->n_device);
     v_parts.reserve(split_v->n_device);
 
+    int n_k_reshaped = 0;
+    int n_v_reshaped = 0;
+    int n_k_heads = 0;
+    int n_v_heads = 0;
+
     for (int id = 0; id < split_k->n_device; ++id) {
         ggml_tensor * split_kl = split_k->splits[id];
         ggml_tensor * split_vl = split_v->splits[id];
@@ -82,7 +87,12 @@ static void gemma4_mtp_prepare_frozen_kv_views(
                 ggml_row_size(split_kl->type, n_embd_head_k) * split_n_head_kv,
                 ggml_row_size(split_kl->type, n_embd_head_k),
                 0);
-        if (k_part->type != GGML_TYPE_F32) {
+        if (auto row_size = ggml_row_size(k_part->type, k_part->ne[0]); row_size % sizeof(float) == 0) {
+            n_k_heads += split_n_head_kv;
+            k_part = ggml_reshape_4d_ext(ctx0, k_part, GGML_TYPE_F32, (row_size/sizeof(float))*k_part->ne[2], k_part->ne[1], 1, 1);
+            ++n_k_reshaped;
+        }
+        else if (k_part->type != GGML_TYPE_F32) {
             k_part = ggml_cast(ctx0, k_part, GGML_TYPE_F32);
         }
         cb(k_part, "mtp_frozen_k_split", 1000 * (assistant_il + 1) + id);
@@ -92,7 +102,12 @@ static void gemma4_mtp_prepare_frozen_kv_views(
             ggml_row_size(split_vl->type, split_n_head_kv * n_embd_head_v),
                 ggml_row_size(split_vl->type, n_embd_head_v),
                 0);
-        if (v_part->type != GGML_TYPE_F32) {
+        if (auto row_size = ggml_row_size(v_part->type, v_part->ne[0]); row_size % sizeof(float) == 0) {
+            v_part = ggml_reshape_4d_ext(ctx0, v_part, GGML_TYPE_F32, (row_size/sizeof(float))*v_part->ne[2], v_part->ne[1], 1, 1);
+            n_v_heads += split_n_head_kv;
+            ++n_v_reshaped;
+        }
+        else if (v_part->type != GGML_TYPE_F32) {
             v_part = ggml_cast(ctx0, v_part, GGML_TYPE_F32);
         }
         cb(v_part, "mtp_frozen_v_split", 1000 * (assistant_il + 1) + id);
@@ -102,12 +117,32 @@ static void gemma4_mtp_prepare_frozen_kv_views(
     }
 
     GGML_ASSERT(!k_parts.empty() && k_parts.size() == v_parts.size());
+    GGML_ASSERT((int)k_parts.size() == n_k_reshaped || n_k_reshaped == 0);
+    GGML_ASSERT((int)v_parts.size() == n_v_reshaped || n_v_reshaped == 0);
 
     ggml_tensor * k_full = k_parts[0];
     ggml_tensor * v_full = v_parts[0];
-    for (size_t i = 1; i < k_parts.size(); ++i) {
-        k_full = ggml_concat(ctx0, k_full, k_parts[i], 2);
-        v_full = ggml_concat(ctx0, v_full, v_parts[i], 2);
+    if ((int)k_parts.size() == n_k_reshaped) {
+        for (int i = 1; i < n_k_reshaped; ++i) {
+            k_full = ggml_concat(ctx0, k_full, k_parts[i], 0);
+        }
+        k_full = ggml_reshape_4d_ext(ctx0, k_full, k_cache->type, n_embd_head_k, n_k_heads, k_full->ne[1], 1);
+        k_full = ggml_permute(ctx0, k_full, 0, 2, 1, 3);
+    } else {
+        for (size_t i = 1; i < k_parts.size(); ++i) {
+            k_full = ggml_concat(ctx0, k_full, k_parts[i], 2);
+        }
+    }
+    if ((int)v_parts.size() == n_v_reshaped) {
+        for (int i = 1; i < n_v_reshaped; ++i) {
+            v_full = ggml_concat(ctx0, v_full, v_parts[i], 0);
+        }
+        v_full = ggml_reshape_4d_ext(ctx0, v_full, v_cache->type, n_embd_head_v, n_v_heads, v_full->ne[1], 1);
+        v_full = ggml_permute(ctx0, v_full, 0, 2, 1, 3);
+    } else {
+        for (size_t i = 1; i < v_parts.size(); ++i) {
+            v_full = ggml_concat(ctx0, v_full, v_parts[i], 2);
+        }
     }
 
     if (k_full->type != GGML_TYPE_F16) {
@@ -134,7 +169,7 @@ static ggml_cgraph * build_gemma4_graph_parallel(llm_build_context & llm, llama_
     int n_device = model.splits.size();
     GGML_ASSERT(n_device > 1);
     GGML_ASSERT(cparams.flash_attn);
-    auto gf = ggml_new_graph_custom(ctx0, model.max_nodes(n_tokens), false);
+    ggml_cgraph * gf = llm.new_graph_custom();
 
     bool is_moe = hparams.n_expert > 0;
 
@@ -178,6 +213,8 @@ static ggml_cgraph * build_gemma4_graph_parallel(llm_build_context & llm, llama_
         auto vl = (ggml_split_tensor_t *)kv_self.v_l[il]->extra;
         GGML_ASSERT(kl && vl);
 
+        int nhave = 0;
+        ggml_tensor * sa_last = nullptr;
         for (int id = 0; id < n_device; ++id) {
             GGML_ASSERT((wq->splits[id] && wk->splits[id] && (!wv || wv->splits[id]) && wo->splits[id]) ||
                     (!wq->splits[id] && !wk->splits[id] && (!wv || !wv->splits[id]) && !wo->splits[id]));
@@ -266,14 +303,18 @@ static ggml_cgraph * build_gemma4_graph_parallel(llm_build_context & llm, llama_
             const int64_t n_head_kv     = wk->splits[id]->ne[1] / n_embd_head_k;
 
             if (cparams.k_cache_hadamard) {
-                Qcur = ggml_hadamard(ctx0, Qcur, n_embd_head_k);
-                Kcur = ggml_hadamard(ctx0, Kcur, n_embd_head_k);
-                cb(Qcur, "Qcur_h", il_cb);
-                cb(Kcur, "Kcur_h", il_cb);
+                if (int block_size = lctx.model.hadamard_size_k(il); block_size > 0) {
+                    Qcur = ggml_hadamard(ctx0, Qcur, block_size);
+                    Kcur = ggml_hadamard(ctx0, Kcur, block_size);
+                    cb(Qcur, "Qcur_h", il_cb);
+                    cb(Kcur, "Kcur_h", il_cb);
+                }
             }
             if (cparams.v_cache_hadamard) {
-                Vcur = ggml_hadamard(ctx0, Vcur, n_embd_head_v);
-                cb(Vcur, "Vcur_h", il_cb);
+                if (int block_size = lctx.model.hadamard_size_v(il); block_size > 0) {
+                    Vcur = ggml_hadamard(ctx0, Vcur, block_size);
+                    cb(Vcur, "Vcur_h", il_cb);
+                }
             }
 
             GGML_ASSERT(kv_self.size == cparams.n_ctx);
@@ -322,8 +363,10 @@ static ggml_cgraph * build_gemma4_graph_parallel(llm_build_context & llm, llama_
             cb(cur, "fa", il_cb);
             cur->op_params[4] = n_swa;
             if (cparams.v_cache_hadamard) {
-                cur = ggml_hadamard(ctx0, cur, n_embd_head_v);
-                cb(cur, "fa_h", il_cb);
+                if (int block_size = lctx.model.hadamard_size_v(il); block_size > 0) {
+                    cur = ggml_hadamard(ctx0, cur, block_size);
+                    cb(cur, "fa_h", il_cb);
+                }
             }
             cur = ggml_reshape_2d(ctx0, cur, wo->splits[id]->ne[0], n_tokens);
             if (il == hparams.n_layer-1 && inp_out_ids) {
@@ -338,10 +381,12 @@ static ggml_cgraph * build_gemma4_graph_parallel(llm_build_context & llm, llama_
             }
             ggml_build_forward_expand(gf, cur);
             sa_out[id] = cur;
+            sa_last = cur;
+            ++nhave;
 
         }
 
-        auto last_ffn_inp = ggml_reduce(ctx0, sa_out.data(), n_device, GGML_OP_ADD);
+        auto last_ffn_inp = nhave > 1 ? ggml_reduce(ctx0, sa_out.data(), n_device, GGML_OP_ADD) : sa_last;
         ggml_build_forward_expand(gf, last_ffn_inp);
         cb(last_ffn_inp, "sa_reduce", il);
 
@@ -362,7 +407,7 @@ static ggml_cgraph * build_gemma4_graph_parallel(llm_build_context & llm, llama_
             }
             int il_cb = 1000*(il + 1) + id;
 
-            GGML_ASSERT(last_ffn_inp && last_ffn_inp->op == GGML_OP_REDUCE);
+            GGML_ASSERT(last_ffn_inp && (nhave == 1 || last_ffn_inp->op == GGML_OP_REDUCE));
             auto cur = llm_build_context::get_input_tensor_sm_graph(ctx0, last_ffn_inp, id);
             cur = llm_build_context::do_split_norm(ctx0, cur, model.layers[il].attn_post_norm, hparams, cb, id, il_cb, false);
             cb(cur, "sa_post", il_cb);
@@ -486,7 +531,7 @@ static ggml_cgraph * build_gemma4_graph_parallel(llm_build_context & llm, llama_
 }
 
 ggml_cgraph * llm_build_context::build_gemma4_mtp() {
-    ggml_cgraph * gf = ggml_new_graph_custom(ctx0, model.max_nodes(n_tokens), false);
+    ggml_cgraph * gf = new_graph_custom();
 
     const int64_t n_embd          = hparams.n_embd;
     const int64_t n_vocab         = hparams.n_vocab;
@@ -495,10 +540,6 @@ ggml_cgraph * llm_build_context::build_gemma4_mtp() {
     const bool    has_target_ctx  = lctx.mtp_target_ctx != nullptr;
 
     GGML_ASSERT(n_backbone > 0);
-
-    lctx.inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, batch.n_tokens);
-    cb(lctx.inp_tokens, "inp_tokens", -1);
-    ggml_set_input(lctx.inp_tokens);
 
     ggml_tensor * hidden_state = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_backbone, n_tokens);
     ggml_set_name(hidden_state, "inp_mtp_states");
@@ -521,6 +562,10 @@ ggml_cgraph * llm_build_context::build_gemma4_mtp() {
         GGML_UNUSED(n_vocab);
         return gf;
     }
+
+    lctx.inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, batch.n_tokens);
+    cb(lctx.inp_tokens, "inp_tokens", -1);
+    ggml_set_input(lctx.inp_tokens);
 
     const llama_model   & target_model   = lctx.mtp_target_ctx->model;
     const llama_hparams & target_hparams = target_model.hparams;
@@ -628,7 +673,7 @@ ggml_cgraph * llm_build_context::build_gemma4_mtp() {
     // not required for correct inference — the full-vocab matmul against the tied output
     // weight still yields valid per-token logits.
     {
-        logits = build_output(lctx, ctx0, cur, model.output, model.output_norm, cb);
+        logits = build_output(lctx, ctx0, cur, model.output, model.output_norm, cb, false);
         cb(logits, "result_output", -1);
     }
     ggml_build_forward_expand(gf, logits);
@@ -685,10 +730,18 @@ ggml_cgraph * llm_build_context::build_gemma4() {
 
     auto inp_out_ids = n_tokens > 1 ? build_inp_out_ids() : nullptr;
 
+    if (model.split_mode == LLAMA_SPLIT_MODE_GRAPH) {
+        return build_gemma4_graph_parallel(*this, lctx, ctx0, inpL, inp_pos, inp_out_ids,
+                                     KQ_mask, KQ_mask_swa, n_tokens,  cb);
+    }
+
+    ggml_cgraph * gf = new_graph_custom();
+
     ggml_tensor * inp_per_layer = nullptr;
     if (model.tok_embd_per_layer) {
         if (batch.token) {
             inp_per_layer = ggml_get_rows(ctx0, model.tok_embd_per_layer, lctx.inp_tokens);
+            ggml_build_forward_expand(gf, inp_per_layer);
             inp_per_layer = ggml_reshape_3d(ctx0, inp_per_layer, hparams.n_embd_per_layer, n_layer, n_tokens);
             inp_per_layer = ggml_scale(ctx0, inp_per_layer, sqrtf((float) hparams.n_embd_per_layer));
             cb(inp_per_layer, "inp_per_layer_selected", -1);
@@ -700,6 +753,7 @@ ggml_cgraph * llm_build_context::build_gemma4() {
             // Extract and dequantize padding token embedding (row 0)
             auto padding = ggml_view_1d(ctx0, model.tok_embd_per_layer, embd_size, 0);
             inp_per_layer = ggml_cast(ctx0, padding, GGML_TYPE_F32);
+            ggml_build_forward_expand(gf, inp_per_layer);
 
             // Reshape to [n_embd_per_layer, n_layer, 1]
             inp_per_layer = ggml_reshape_3d(ctx0, inp_per_layer, hparams.n_embd_per_layer, n_layer, 1);
@@ -709,13 +763,6 @@ ggml_cgraph * llm_build_context::build_gemma4() {
                 model.hparams.n_embd_per_layer, n_layer, n_tokens, inpL, inp_per_layer);
 
     }
-
-    if (model.split_mode == LLAMA_SPLIT_MODE_GRAPH) {
-        return build_gemma4_graph_parallel(*this, lctx, ctx0, inpL, inp_pos, inp_out_ids,
-                                     KQ_mask, KQ_mask_swa, n_tokens,  cb);
-    }
-
-    auto gf = ggml_new_graph_custom(ctx0, model.max_nodes(n_tokens), false);
 
     // "5-to-1 interleaved attention"
     // 5 layers of local attention followed by 1 layer of global attention
